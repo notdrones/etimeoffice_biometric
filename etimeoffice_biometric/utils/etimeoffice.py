@@ -24,22 +24,18 @@ def _build_auth_header(settings):
 # ─── API Call ─────────────────────────────────────────────────────────────────
 
 def fetch_punch_data(settings, emp_code="ALL", from_date=None, to_date=None):
-    base_url = (settings.api_base_url or "https://api.etimeoffice.com").rstrip("/")
-    url = (
-        f"{base_url}/api/DownloadPunchDataMCID"
-        f"?Empcode={emp_code}"
-        f"&FromDate={from_date}"
-        f"&ToDate={to_date}"
-    )
-    headers = _build_auth_header(settings)
+    base_url    = (settings.api_base_url or "https://api.etimeoffice.com").rstrip("/")
+    endpoint    = f"{base_url}/api/DownloadPunchDataMCID"
+    params      = {"Empcode": emp_code, "FromDate": from_date, "ToDate": to_date}
+    headers     = _build_auth_header(settings)
 
     frappe.logger("biometric").debug(
-        f"[Biometric API] GET {url} | Empcode={emp_code} "
+        f"[Biometric API] GET {endpoint} | Empcode={emp_code} "
         f"FromDate={from_date} ToDate={to_date}"
     )
 
     try:
-        response = requests.get(url, headers=headers, timeout=60)
+        response = requests.get(endpoint, headers=headers, params=params, timeout=60)
         response.raise_for_status()
     except requests.exceptions.Timeout:
         raise Exception("eTimeOffice API request timed out (60 s). Please try again.")
@@ -50,7 +46,7 @@ def fetch_punch_data(settings, emp_code="ALL", from_date=None, to_date=None):
         frappe.logger("biometric").error(
             "[Biometric API ERROR]"
             f"\nStatus: {response.status_code}"
-            f"\nURL: {url}"
+            f"\nURL: {response.url}"
             f"\nResponse: {body}"
         )
         raise Exception(f"HTTP {response.status_code}: {body}")

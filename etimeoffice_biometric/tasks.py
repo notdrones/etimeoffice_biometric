@@ -47,8 +47,10 @@ def run_scheduled_sync():
 
         log = fetch_and_sync(emp_code="ALL", from_date=from_date, to_date=to_date)
 
-        # Update last sync time only on success/partial
-        if log.status in ("Success", "Partial"):
+        # Only advance the sync window when records were actually returned.
+        # An empty response (API blip, wrong date range) must not move the pointer
+        # forward or that window's punches will never be re-fetched.
+        if log.status in ("Success", "Partial") and (log.records_fetched or 0) > 0:
             frappe.db.set_single_value("Biometric Settings", "last_sync_time", now)
 
         frappe.logger("biometric").info(
@@ -107,20 +109,23 @@ def _check_schedule(settings, now):
     if schedule == "Daily":
         return now.hour == 0 and now.minute < 5
 
-    if schedule == "Custom" and settings.custom_cron:
+    if schedule == "Custom":
+        if not settings.custom_cron:
+            # Custom selected but expression not configured — skip until it is.
+            return False
         try:
             import datetime as dt
             from croniter import croniter
-            cron = croniter(settings.custom_cron, now - dt.timedelta(hours=1))
-            next_run = cron.get_next(dt.datetime)
-            # Run if the next scheduled time is within the past hour window
-            return (next_run - now).total_seconds() <= 0 or \
-                   abs((next_run - now).total_seconds()) < 3600
+            # Find the most recent time this cron was due before now.
+            # Fire if that was within the past hour (scheduler interval).
+            cron = croniter(settings.custom_cron, now)
+            prev_run = cron.get_prev(dt.datetime)
+            return (now - prev_run).total_seconds() < 3600
         except Exception:
             frappe.log_error(frappe.get_traceback(), "[Biometric] Cron Parse Error")
             return False
 
-    return True
+    return False
 
 
 # ─── Internal datetime helper ─────────────────────────────────────────────────

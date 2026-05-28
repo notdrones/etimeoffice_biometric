@@ -57,11 +57,15 @@ def fetch_and_sync(emp_code="ALL", from_date=None, to_date=None):
 
     # ── Create a pending Sync Log ─────────────────────────────────────────────
     log = frappe.new_doc("Biometric Sync Log")
-    log.sync_time       = now
-    log.employee_filter = emp_code
-    log.from_date       = from_date
-    log.to_date         = to_date
-    log.status          = "Failed"
+    log.sync_time         = now
+    log.employee_filter   = emp_code
+    log.from_date         = from_date
+    log.to_date           = to_date
+    log.status            = "Failed"
+    log.records_fetched   = 0
+    log.records_created   = 0
+    log.records_skipped   = 0
+    log.records_not_found = 0
 
     try:
         from etimeoffice_biometric.utils.etimeoffice import fetch_punch_data
