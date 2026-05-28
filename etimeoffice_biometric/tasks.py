@@ -109,24 +109,20 @@ def _check_schedule(settings, now):
     if schedule == "Daily":
         return now.hour == 0 and now.minute < 5
 
-    if schedule == "Custom":
-        if not settings.custom_cron:
-            # Custom selected but expression not configured — skip until it is.
-            return False
+    if schedule == "Custom" and settings.custom_cron:
         try:
             import datetime as dt
             from croniter import croniter
-            # Find the next scheduled occurrence from now.
-            # Fire if it falls within the next hour — meaning this hourly
-            # scheduler tick is the right one to handle it.
-            cron = croniter(settings.custom_cron, now)
+            cron = croniter(settings.custom_cron, now - dt.timedelta(hours=1))
             next_run = cron.get_next(dt.datetime)
-            return (next_run - now).total_seconds() < 3600
+            # Run if the next scheduled time is within the past hour window
+            return (next_run - now).total_seconds() <= 0 or \
+                   abs((next_run - now).total_seconds()) < 3600
         except Exception:
             frappe.log_error(frappe.get_traceback(), "[Biometric] Cron Parse Error")
             return False
 
-    return False
+    return True
 
 
 # ─── Internal datetime helper ─────────────────────────────────────────────────
