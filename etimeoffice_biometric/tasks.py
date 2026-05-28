@@ -116,11 +116,12 @@ def _check_schedule(settings, now):
         try:
             import datetime as dt
             from croniter import croniter
-            # Find the most recent time this cron was due before now.
-            # Fire if that was within the past hour (scheduler interval).
+            # Find the next scheduled occurrence from now.
+            # Fire if it falls within the next hour — meaning this hourly
+            # scheduler tick is the right one to handle it.
             cron = croniter(settings.custom_cron, now)
-            prev_run = cron.get_prev(dt.datetime)
-            return (now - prev_run).total_seconds() < 3600
+            next_run = cron.get_next(dt.datetime)
+            return (next_run - now).total_seconds() < 3600
         except Exception:
             frappe.log_error(frappe.get_traceback(), "[Biometric] Cron Parse Error")
             return False
