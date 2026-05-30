@@ -188,8 +188,7 @@ def _process_punches(punch_list):
             not_found += 1
             continue
 
-        emp_default_shift = employee_info[empcode]  # "" if no default shift configured
-        start_of_day      = f"{_date} 00:00:00"
+        start_of_day = f"{_date} 00:00:00"
         end_of_day        = f"{_date} 23:59:59"
 
         existing_rows    = existing_map.get((empcode, _date), [])
@@ -258,16 +257,24 @@ def _process_punches(punch_list):
                             f"({empcode} at {entry['time_str']})"
                         )
 
-                # Fix null shift on app-inserted records. fetch_shift() only uses
-                # Shift Assignments; employees with only a default_shift get null
-                # shift on insert, making ERPNext's process_auto_attendance() skip
-                # them and wrongly mark attendance as Absent.
-                if entry["device_id"] and not entry["shift"] and emp_default_shift:
-                    updates["shift"] = emp_default_shift
-                    frappe.logger("biometric").info(
-                        f"[Biometric] Fixed null shift for {entry['name']} "
-                        f"({empcode} at {entry['time_str']}): set to '{emp_default_shift}'"
-                    )
+                # Fix null shift on app-inserted records — call fetch_shift() on
+                # the committed record so it resolves correctly (same path as
+                # the UI "Fetch Shift" button).
+                if entry["device_id"] and not entry["shift"]:
+                    try:
+                        tmp = frappe.get_doc("Employee Checkin", entry["name"])
+                        tmp.fetch_shift()
+                        if tmp.shift:
+                            updates["shift"] = tmp.shift
+                            frappe.logger("biometric").info(
+                                f"[Biometric] Fixed null shift for {entry['name']} "
+                                f"({empcode} at {entry['time_str']}): set to '{tmp.shift}'"
+                            )
+                    except Exception:
+                        frappe.logger("biometric").warning(
+                            f"[Biometric] fetch_shift() failed while fixing existing "
+                            f"record {entry['name']} ({empcode} at {entry['time_str']})"
+                        )
 
                 if updates:
                     frappe.db.set_value(
@@ -281,27 +288,29 @@ def _process_punches(punch_list):
                 doc.log_type  = correct
                 doc.device_id = entry["mcid"] or ""
 
-                # Populate shift before insert so ERPNext's process_auto_attendance()
-                # can find this record (it filters by shift name).
+                # Bypass geolocation validate() — biometric devices have no GPS.
+                # device_id already identifies the physical reader for audit.
+                doc.flags.ignore_mandatory = True
+                doc.flags.ignore_validate  = True
+                doc.insert(ignore_permissions=True)
+
+                # Fetch shift AFTER insert so the document exists in the DB.
+                # fetch_shift() calls get_actual_start_end_datetime_of_shift()
+                # which resolves correctly only once the record is committed —
+                # the same path the UI "Fetch Shift" button takes.
                 try:
                     doc.fetch_shift()
+                    if doc.shift:
+                        frappe.db.set_value(
+                            "Employee Checkin", doc.name, "shift", doc.shift,
+                            update_modified=False,
+                        )
                 except Exception:
                     frappe.logger("biometric").warning(
                         f"[Biometric] fetch_shift() failed for {empcode} "
                         f"at {entry['dt']} — shift field will be empty"
                     )
 
-                # fetch_shift() only looks at Shift Assignments. If the employee
-                # has no assignment but has a default_shift on their Employee record,
-                # use that so process_auto_attendance() can find this checkin.
-                if not doc.shift and emp_default_shift:
-                    doc.shift = emp_default_shift
-
-                # Bypass geolocation validate() — biometric devices have no GPS.
-                # device_id already identifies the physical reader for audit.
-                doc.flags.ignore_mandatory = True
-                doc.flags.ignore_validate  = True
-                doc.insert(ignore_permissions=True)
                 created       += 1
                 group_created += 1
 
