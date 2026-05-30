@@ -198,11 +198,13 @@ def _process_punches(punch_list):
                 "mcid":             None,
             })
 
+        seen_batch: set = set()  # guards against duplicate timestamps in one API response
         for punch in sorted(punches, key=lambda x: x["dt"]):
             time_str = punch["dt"].strftime("%Y-%m-%d %H:%M:%S")
-            if time_str in existing_by_time:
+            if time_str in existing_by_time or time_str in seen_batch:
                 skipped += 1
                 continue
+            seen_batch.add(time_str)
             all_entries.append({
                 "time_str":         time_str,
                 "dt":               punch["dt"],
