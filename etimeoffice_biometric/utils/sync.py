@@ -130,6 +130,42 @@ def _process_punches(punch_list):
     skipped   = 0
     not_found = 0
 
+    # ── Batch-fetch all existing checkins for the entire date range at once ───
+    # One query covering every employee-day in this API response instead of one
+    # SELECT per (employee, date) group — reduces DB round-trips from O(N×D) to 1.
+    # Also fetches device_id so we can distinguish app-inserted vs manual records.
+    if groups:
+        all_empcodes = tuple({empcode for (empcode, _) in groups.keys()})
+        all_dates    = sorted({_date for (_, _date) in groups.keys()})
+        batch_start  = f"{min(all_dates)} 00:00:00"
+        batch_end    = f"{max(all_dates)} 23:59:59"
+
+        existing_all = frappe.db.sql("""
+            SELECT employee,
+                   name,
+                   time,
+                   log_type,
+                   device_id
+            FROM `tabEmployee Checkin`
+            WHERE employee IN %s
+              AND time BETWEEN %s AND %s
+            ORDER BY employee, time ASC
+        """, (all_empcodes, batch_start, batch_end), as_dict=True)
+
+        existing_map = defaultdict(list)
+        for row in existing_all:
+            row_dt   = _ensure_datetime(row.time)
+            row_date = row_dt.date()
+            existing_map[(row.employee, row_date)].append({
+                "name":             row.name,
+                "time_str":         row_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "dt":               row_dt,
+                "current_log_type": row.log_type,
+                "device_id":        row.device_id,
+            })
+    else:
+        existing_map = {}
+
     for (empcode, _date), punches in groups.items():
 
         # Validate employee exists (Empcode == ERPNext Employee ID)
@@ -143,76 +179,69 @@ def _process_punches(punch_list):
         start_of_day = f"{_date} 00:00:00"
         end_of_day   = f"{_date} 23:59:59"
 
-        # ── Fetch all existing checkins for this employee on this day ─────────
-        # We need the full picture (existing + incoming) to assign IN/OUT by
-        # chronological position correctly — even when punches arrive across
-        # separate sync runs due to device upload delays.
-        existing_rows = frappe.db.sql("""
-            SELECT name,
-                   DATE_FORMAT(time, '%%Y-%%m-%%d %%H:%%i:%%s') AS time_str,
-                   log_type
-            FROM `tabEmployee Checkin`
-            WHERE employee = %s
-              AND time BETWEEN %s AND %s
-            ORDER BY time ASC
-        """, (empcode, start_of_day, end_of_day), as_dict=True)
+        existing_rows    = existing_map.get((empcode, _date), [])
+        existing_by_time = {row["time_str"]: row for row in existing_rows}
 
-        existing_by_time = {row.time_str: row for row in existing_rows}
+        # ── Build merged list: existing + new, sorted chronologically ─────────
+        # existing_rows already deduplicates DB records. New punches are appended
+        # only when their timestamp is absent from existing_by_time.
+        all_entries = []
 
-        # ── Identify truly new punches (not already in DB) ────────────────────
-        # Intra-batch dedup handled by seen_times; DB dedup by existing_by_time.
-        new_punches = []
-        seen_times: set = set()
+        for row in existing_rows:
+            all_entries.append({
+                "time_str":         row["time_str"],
+                "dt":               row["dt"],
+                "name":             row["name"],
+                "current_log_type": row["current_log_type"],
+                "is_existing":      True,
+                "device_id":        row["device_id"],
+                "mcid":             None,
+            })
 
         for punch in sorted(punches, key=lambda x: x["dt"]):
             time_str = punch["dt"].strftime("%Y-%m-%d %H:%M:%S")
-            if time_str in existing_by_time or time_str in seen_times:
+            if time_str in existing_by_time:
                 skipped += 1
                 continue
-            seen_times.add(time_str)
-            new_punches.append({"time_str": time_str, "dt": punch["dt"], "mcid": punch["mcid"]})
-
-        # ── Build merged list: existing + new, sorted chronologically ─────────
-        all_entries = []
-        for row in existing_rows:
             all_entries.append({
-                "time_str":          row.time_str,
-                "dt":                datetime.datetime.strptime(row.time_str, "%Y-%m-%d %H:%M:%S"),
-                "name":              row.name,
-                "current_log_type":  row.log_type,
-                "is_existing":       True,
-                "mcid":              None,
-            })
-        for p in new_punches:
-            all_entries.append({
-                "time_str":         p["time_str"],
-                "dt":               p["dt"],
+                "time_str":         time_str,
+                "dt":               punch["dt"],
                 "name":             None,
                 "current_log_type": None,
                 "is_existing":      False,
-                "mcid":             p["mcid"],
+                "device_id":        None,
+                "mcid":             punch["mcid"],
             })
+
         all_entries.sort(key=lambda x: x["dt"])
 
         # ── Assign log_type by position: index 0 = IN, all others = OUT ───────
-        # This is correct for any number of punches — first arrival is IN,
-        # the last OUT wins for attendance (via skip_auto_attendance below).
-        # If a previous sync assigned the wrong type (e.g., an evening punch
-        # was wrongly marked IN because morning data hadn't uploaded yet),
-        # correct it here rather than leaving stale data.
+        # First arrival is IN; all subsequent punches are OUT. The latest OUT
+        # wins for attendance calculation (via skip_auto_attendance below).
+        # If a prior sync assigned the wrong type it is corrected here, but only
+        # for records this app inserted (device_id set) — manual HR edits
+        # (device_id empty) are left untouched to preserve HR overrides.
+        group_created = 0
+
         for idx, entry in enumerate(all_entries):
             correct = "IN" if idx == 0 else "OUT"
 
             if entry["is_existing"]:
                 if entry["current_log_type"] != correct:
-                    frappe.db.set_value(
-                        "Employee Checkin", entry["name"], "log_type", correct,
-                        update_modified=False,
-                    )
-                    frappe.logger("biometric").info(
-                        f"[Biometric] Corrected log_type for {empcode} at "
-                        f"{entry['time_str']}: {entry['current_log_type']} → {correct}"
-                    )
+                    if entry["device_id"]:
+                        frappe.db.set_value(
+                            "Employee Checkin", entry["name"], "log_type", correct,
+                            update_modified=False,
+                        )
+                        frappe.logger("biometric").info(
+                            f"[Biometric] Corrected log_type for {empcode} at "
+                            f"{entry['time_str']}: {entry['current_log_type']} → {correct}"
+                        )
+                    else:
+                        frappe.logger("biometric").info(
+                            f"[Biometric] Preserving manual edit on {entry['name']} "
+                            f"({empcode} at {entry['time_str']})"
+                        )
             else:
                 doc = frappe.new_doc("Employee Checkin")
                 doc.employee  = empcode
@@ -235,33 +264,34 @@ def _process_punches(punch_list):
                 doc.flags.ignore_mandatory = True
                 doc.flags.ignore_validate  = True
                 doc.insert(ignore_permissions=True)
-                created += 1
+                created       += 1
+                group_created += 1
 
-        # ── Keep only the latest OUT active for attendance calculation ─────────
-        # All intermediate OUTs are marked skip_auto_attendance=1 so ERPNext
-        # uses first IN + last OUT when computing worked hours.
-        frappe.db.sql("""
-            UPDATE `tabEmployee Checkin`
-            SET skip_auto_attendance = 1
-            WHERE employee = %(employee)s
-              AND log_type = 'OUT'
-              AND time BETWEEN %(start_of_day)s AND %(end_of_day)s
-              AND name != (
-                  SELECT latest_name FROM (
-                      SELECT name AS latest_name
-                      FROM `tabEmployee Checkin`
-                      WHERE employee = %(employee)s
-                        AND log_type = 'OUT'
-                        AND time BETWEEN %(start_of_day)s AND %(end_of_day)s
-                      ORDER BY time DESC
-                      LIMIT 1
-                  ) AS subquery
-              )
-        """, {
-            "employee":    empcode,
-            "start_of_day": start_of_day,
-            "end_of_day":   end_of_day,
-        })
+        # ── Consolidate OUTs — only when new records were just added ──────────
+        # Skip the self-join UPDATE on syncs where nothing changed for this group.
+        if group_created > 0:
+            frappe.db.sql("""
+                UPDATE `tabEmployee Checkin`
+                SET skip_auto_attendance = 1
+                WHERE employee = %(employee)s
+                  AND log_type = 'OUT'
+                  AND time BETWEEN %(start_of_day)s AND %(end_of_day)s
+                  AND name != (
+                      SELECT latest_name FROM (
+                          SELECT name AS latest_name
+                          FROM `tabEmployee Checkin`
+                          WHERE employee = %(employee)s
+                            AND log_type = 'OUT'
+                            AND time BETWEEN %(start_of_day)s AND %(end_of_day)s
+                          ORDER BY time DESC
+                          LIMIT 1
+                      ) AS subquery
+                  )
+            """, {
+                "employee":     empcode,
+                "start_of_day": start_of_day,
+                "end_of_day":   end_of_day,
+            })
 
     return created, skipped, not_found
 
