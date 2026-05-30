@@ -33,12 +33,18 @@ def run_scheduled_sync():
 
         from etimeoffice_biometric.utils.sync import fetch_and_sync
 
-        # Determine from_date: use last_sync_time or fall back to sync_days_back
+        # Determine from_date: use last_sync_time or fall back to sync_days_back.
+        # Roll back to midnight of the last sync day so punches that were recorded
+        # before the previous run but uploaded to eTimeOffice after it (device
+        # offline, network blip, upload delay) are always captured. Deduplication
+        # in sync.py absorbs records that were already inserted.
         import datetime
         days_back = int(settings.sync_days_back or 1)
         from_date = None
         if settings.last_sync_time:
-            from_date = _safe_to_datetime(settings.last_sync_time)
+            last_sync_dt = _safe_to_datetime(settings.last_sync_time)
+            if last_sync_dt:
+                from_date = last_sync_dt.replace(hour=0, minute=0, second=0, microsecond=0)
         if from_date is None:
             # Either last_sync_time was empty or unparseable — use days_back
             from_date = now - datetime.timedelta(days=days_back)
