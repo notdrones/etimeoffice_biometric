@@ -133,7 +133,7 @@ def _process_punches(punch_list):
     # ── Batch-fetch all existing checkins for the entire date range at once ───
     # One query covering every employee-day in this API response instead of one
     # SELECT per (employee, date) group — reduces DB round-trips from O(N×D) to 1.
-    # Also fetches device_id so we can distinguish app-inserted vs manual records.
+    # Fetches device_id (app vs manual) and shift (to detect and fix null-shift records).
     if groups:
         all_empcodes = tuple({empcode for (empcode, _) in groups.keys()})
         all_dates    = sorted({_date for (_, _date) in groups.keys()})
@@ -145,7 +145,8 @@ def _process_punches(punch_list):
                    name,
                    time,
                    log_type,
-                   device_id
+                   device_id,
+                   shift
             FROM `tabEmployee Checkin`
             WHERE employee IN %s
               AND time BETWEEN %s AND %s
@@ -162,22 +163,34 @@ def _process_punches(punch_list):
                 "dt":               row_dt,
                 "current_log_type": row.log_type,
                 "device_id":        row.device_id,
+                "shift":            row.shift,
             })
+
+        # Batch-fetch employee existence + default_shift in one query.
+        # Replaces per-group frappe.db.exists() calls and gives us the fallback
+        # shift for employees who have a default shift but no Shift Assignment.
+        emp_rows = frappe.db.sql("""
+            SELECT name, default_shift FROM `tabEmployee` WHERE name IN %s
+        """, (all_empcodes,), as_dict=True)
+        employee_info = {row.name: (row.default_shift or "") for row in emp_rows}
     else:
-        existing_map = {}
+        existing_map  = {}
+        employee_info = {}
 
     for (empcode, _date), punches in groups.items():
 
-        # Validate employee exists (Empcode == ERPNext Employee ID)
-        if not frappe.db.exists("Employee", empcode):
+        # Validate employee exists — use the pre-fetched employee_info dict
+        # (batch query replaced per-group frappe.db.exists calls).
+        if empcode not in employee_info:
             frappe.logger("biometric").warning(
                 f"[Biometric] Employee not found for Empcode '{empcode}'. Skipping."
             )
             not_found += 1
             continue
 
-        start_of_day = f"{_date} 00:00:00"
-        end_of_day   = f"{_date} 23:59:59"
+        emp_default_shift = employee_info[empcode]  # "" if no default shift configured
+        start_of_day      = f"{_date} 00:00:00"
+        end_of_day        = f"{_date} 23:59:59"
 
         existing_rows    = existing_map.get((empcode, _date), [])
         existing_by_time = {row["time_str"]: row for row in existing_rows}
@@ -195,6 +208,7 @@ def _process_punches(punch_list):
                 "current_log_type": row["current_log_type"],
                 "is_existing":      True,
                 "device_id":        row["device_id"],
+                "shift":            row["shift"],
                 "mcid":             None,
             })
 
@@ -212,6 +226,7 @@ def _process_punches(punch_list):
                 "current_log_type": None,
                 "is_existing":      False,
                 "device_id":        None,
+                "shift":            None,
                 "mcid":             punch["mcid"],
             })
 
@@ -220,21 +235,19 @@ def _process_punches(punch_list):
         # ── Assign log_type by position: index 0 = IN, all others = OUT ───────
         # First arrival is IN; all subsequent punches are OUT. The latest OUT
         # wins for attendance calculation (via skip_auto_attendance below).
-        # If a prior sync assigned the wrong type it is corrected here, but only
-        # for records this app inserted (device_id set) — manual HR edits
-        # (device_id empty) are left untouched to preserve HR overrides.
+        # Corrections only touch app-inserted records (device_id set); manual
+        # HR edits (device_id empty) are preserved.
         group_created = 0
 
         for idx, entry in enumerate(all_entries):
             correct = "IN" if idx == 0 else "OUT"
 
             if entry["is_existing"]:
+                updates = {}
+
                 if entry["current_log_type"] != correct:
                     if entry["device_id"]:
-                        frappe.db.set_value(
-                            "Employee Checkin", entry["name"], "log_type", correct,
-                            update_modified=False,
-                        )
+                        updates["log_type"] = correct
                         frappe.logger("biometric").info(
                             f"[Biometric] Corrected log_type for {empcode} at "
                             f"{entry['time_str']}: {entry['current_log_type']} → {correct}"
@@ -244,6 +257,23 @@ def _process_punches(punch_list):
                             f"[Biometric] Preserving manual edit on {entry['name']} "
                             f"({empcode} at {entry['time_str']})"
                         )
+
+                # Fix null shift on app-inserted records. fetch_shift() only uses
+                # Shift Assignments; employees with only a default_shift get null
+                # shift on insert, making ERPNext's process_auto_attendance() skip
+                # them and wrongly mark attendance as Absent.
+                if entry["device_id"] and not entry["shift"] and emp_default_shift:
+                    updates["shift"] = emp_default_shift
+                    frappe.logger("biometric").info(
+                        f"[Biometric] Fixed null shift for {entry['name']} "
+                        f"({empcode} at {entry['time_str']}): set to '{emp_default_shift}'"
+                    )
+
+                if updates:
+                    frappe.db.set_value(
+                        "Employee Checkin", entry["name"], updates,
+                        update_modified=False,
+                    )
             else:
                 doc = frappe.new_doc("Employee Checkin")
                 doc.employee  = empcode
@@ -260,6 +290,12 @@ def _process_punches(punch_list):
                         f"[Biometric] fetch_shift() failed for {empcode} "
                         f"at {entry['dt']} — shift field will be empty"
                     )
+
+                # fetch_shift() only looks at Shift Assignments. If the employee
+                # has no assignment but has a default_shift on their Employee record,
+                # use that so process_auto_attendance() can find this checkin.
+                if not doc.shift and emp_default_shift:
+                    doc.shift = emp_default_shift
 
                 # Bypass geolocation validate() — biometric devices have no GPS.
                 # device_id already identifies the physical reader for audit.
