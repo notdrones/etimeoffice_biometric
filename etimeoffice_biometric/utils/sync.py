@@ -214,6 +214,19 @@ def _process_punches(punch_list):
             doc.log_type  = ci["log_type"]
             doc.device_id = ci["device_id"]
 
+            # Populate the shift field before insert. validate() is bypassed
+            # below to skip geolocation checks, but fetch_shift() must still
+            # run — ERPNext's process_auto_attendance() queries
+            # `WHERE shift = <shift_name>`, so checkins with a NULL shift are
+            # invisible to it and employees get wrongly marked Absent.
+            try:
+                doc.fetch_shift()
+            except Exception:
+                frappe.logger("biometric").warning(
+                    f"[Biometric] fetch_shift() failed for {ci['employee']} "
+                    f"at {ci['time']} — shift field will be empty"
+                )
+
             # ── Geolocation handling ──────────────────────────────────────────
             # When HR Settings has geolocation tracking enabled, ERPNext's
             # Employee Checkin validate() throws if latitude/longitude are
