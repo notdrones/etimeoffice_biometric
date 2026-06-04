@@ -73,12 +73,21 @@ def fetch_and_sync(emp_code="ALL", from_date=None, to_date=None):
         punch_list = fetch_punch_data(settings, emp_code, from_date_str, to_date_str)
         log.records_fetched = len(punch_list)
 
-        created, skipped, not_found = _process_punches(punch_list)
+        created, skipped, not_found, shift_min_times = _process_punches(punch_list)
 
         log.records_created = created
         log.records_skipped = skipped
         log.records_not_found = not_found
         log.status = "Success" if not_found == 0 else "Partial"
+
+        # Reset each affected Shift Type's last_sync_of_checkin to just before
+        # the earliest punch we inserted. This ensures ERPNext's scheduled
+        # process_auto_attendance job finds and processes all newly inserted
+        # historical records. Without this, after_insert fires during each
+        # checkin insert and advances the watermark to server time, making
+        # historical punch times invisible to future scheduler runs.
+        if shift_min_times:
+            _reset_shift_watermarks(shift_min_times)
 
     except Exception as exc:
         log.error_message = str(exc)
@@ -99,7 +108,9 @@ def _process_punches(punch_list):
     Group punches by (Empcode, date), determine IN/OUT, and insert records.
 
     Returns:
-        (created: int, skipped: int, not_found: int)
+        (created: int, skipped: int, not_found: int, shift_min_times: dict)
+        shift_min_times maps Shift Type name → earliest inserted punch datetime.
+        Used by fetch_and_sync to reset last_sync_of_checkin after the batch.
     """
     # ── Group by (empcode, calendar_date) ─────────────────────────────────────
     groups = defaultdict(list)
@@ -126,9 +137,10 @@ def _process_punches(punch_list):
         })
 
     # ── Insert Employee Checkin records ───────────────────────────────────────
-    created   = 0
-    skipped   = 0
-    not_found = 0
+    created         = 0
+    skipped         = 0
+    not_found       = 0
+    shift_min_times = {}   # {shift_type_name: earliest_punch_datetime}
 
     # ── Batch-fetch existing checkins and employee validity in two queries ────
     # One checkin SELECT for the full date range × all employees (O(1) queries).
@@ -242,6 +254,11 @@ def _process_punches(punch_list):
                 if entry["current_log_type"] != correct:
                     if entry["device_id"]:
                         updates["log_type"] = correct
+                        # A record corrected from OUT→IN may have had skip=1 set
+                        # while it was an intermediate OUT. Clear it so ERPNext
+                        # auto-attendance can use this record as the IN anchor.
+                        if correct == "IN":
+                            updates["skip_auto_attendance"] = 0
                         frappe.logger("biometric").info(
                             f"[Biometric] Corrected log_type for {empcode} at "
                             f"{entry['time_str']}: {entry['current_log_type']} → {correct}"
@@ -270,9 +287,10 @@ def _process_punches(punch_list):
                                 f"({empcode}): set to '{shift_upd['shift']}'"
                             )
                     except Exception:
-                        frappe.logger("biometric").warning(
-                            f"[Biometric] fetch_shift() failed for existing "
-                            f"record {entry['name']} ({empcode} at {entry['time_str']})"
+                        frappe.log_error(
+                            frappe.get_traceback(),
+                            f"[Biometric] fetch_shift() failed for existing record "
+                            f"{entry['name']} ({empcode} at {entry['time_str']})",
                         )
 
                 if updates:
@@ -289,17 +307,23 @@ def _process_punches(punch_list):
                 doc.log_type  = correct
                 doc.device_id = entry["mcid"] or ""
 
-                # Bypass geolocation validate() — biometric devices have no GPS.
-                # device_id identifies the physical reader for audit purposes.
-                doc.flags.ignore_mandatory = True
-                doc.flags.ignore_validate  = True
+                # ignore_mandatory: biometric records have no GPS coordinates,
+                #   so lat/lon/geolocation mandatory checks must be skipped.
+                # ignore_validate: bypasses any geolocation assertion in validate().
+                #   fetch_shift() is called manually below instead.
+                # ignore_after_insert: prevents ERPNext's after_insert from calling
+                #   process_auto_attendance() on each insert. That call advances
+                #   Shift Type.last_sync_of_checkin to server time, which places
+                #   all historical punch times (in the past) behind the watermark
+                #   and makes them invisible to the daily scheduler. We reset the
+                #   watermark ourselves at the end of fetch_and_sync() instead.
+                doc.flags.ignore_mandatory    = True
+                doc.flags.ignore_validate     = True
+                doc.flags.ignore_after_insert = True
                 doc.insert(ignore_permissions=True)
 
                 # Call fetch_shift() AFTER insert so the document is committed
                 # and ERPNext can resolve all shift timing fields correctly.
-                # validate() would call this automatically but we bypassed it;
-                # we replicate that step here so process_auto_attendance() has
-                # the shift, shift_actual_start/end, shift_start/end it needs.
                 try:
                     doc.fetch_shift()
                     shift_upd = _collect_shift_updates(doc)
@@ -308,10 +332,16 @@ def _process_punches(punch_list):
                             "Employee Checkin", doc.name, shift_upd,
                             update_modified=False,
                         )
+                        # Track the earliest punch time per shift so we can reset
+                        # last_sync_of_checkin after the full batch completes.
+                        sname = shift_upd.get("shift")
+                        if sname:
+                            if sname not in shift_min_times or entry["dt"] < shift_min_times[sname]:
+                                shift_min_times[sname] = entry["dt"]
                 except Exception:
-                    frappe.logger("biometric").warning(
-                        f"[Biometric] fetch_shift() failed for {empcode} "
-                        f"at {entry['dt']} — shift fields will be empty"
+                    frappe.log_error(
+                        frappe.get_traceback(),
+                        f"[Biometric] fetch_shift() failed for {empcode} at {entry['dt']}",
                     )
 
                 created       += 1
@@ -346,7 +376,7 @@ def _process_punches(punch_list):
                 "end_of_day":   end_of_day,
             })
 
-    return created, skipped, not_found
+    return created, skipped, not_found, shift_min_times
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -371,12 +401,60 @@ def _collect_shift_updates(doc):
     result = {}
     for field in (
         "shift", "shift_actual_start", "shift_actual_end",
-        "shift_start", "shift_end", "offshift", "overtime_type",
+        "shift_start", "shift_end", "overtime_type",
+        # offshift intentionally excluded: if fetch_shift() finds no shift it
+        # sets offshift=1, which causes process_auto_attendance to permanently
+        # skip the checkin. We leave that field at its default (0) so ERPNext
+        # can re-evaluate it at attendance-processing time; if the shift
+        # assignment is later added or corrected, the checkin can still be used.
     ):
         val = doc.get(field)
         if val is not None:
             result[field] = val
     return result
+
+
+def _reset_shift_watermarks(shift_min_times):
+    """
+    For each Shift Type that received new checkins this sync run, reset
+    last_sync_of_checkin to 1 second before the earliest punch we inserted.
+
+    ERPNext's process_auto_attendance filters checkins using:
+        checkin.time >= shift_type.last_sync_of_checkin
+
+    When our sync inserts historical punch records (times in the past),
+    after_insert may have already advanced last_sync_of_checkin to server time,
+    placing those punch times behind the watermark. This function pulls the
+    watermark back so the next scheduler run picks up all the new records.
+
+    We only reset if the current watermark is ahead of our earliest punch —
+    we never push the watermark forward or touch unaffected shifts.
+    """
+    for shift_name, min_punch_dt in shift_min_times.items():
+        try:
+            current_raw = frappe.db.get_value("Shift Type", shift_name, "last_sync_of_checkin")
+            if not current_raw:
+                continue
+
+            current_watermark = _ensure_datetime(current_raw)
+            # Set watermark to 1 second before the earliest punch we inserted.
+            new_watermark = min_punch_dt - datetime.timedelta(seconds=1)
+
+            if current_watermark > new_watermark:
+                frappe.db.set_value(
+                    "Shift Type", shift_name,
+                    "last_sync_of_checkin", new_watermark,
+                    update_modified=False,
+                )
+                frappe.logger("biometric").info(
+                    f"[Biometric] Reset last_sync_of_checkin for '{shift_name}' "
+                    f"from {current_watermark} → {new_watermark}"
+                )
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"[Biometric] Failed to reset watermark for Shift Type '{shift_name}'",
+            )
 
 
 def _parse_punch_datetime(s):
